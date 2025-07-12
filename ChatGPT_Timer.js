@@ -1,74 +1,142 @@
 // ==UserScript==
 // @name         ChatGPT回复计时器
 // @namespace    http://tampermonkey.net/
-// @version      2.1.2
-// @description  计时 ChatGPT 每次回复耗时
+// @version      2.2
+// @description  计时 ChatGPT 每次回复耗时（修复完整版 - 计时到回复完成）
 // @author       schweigen
 // @match        https://chatgpt.com/*
 // @exclude      https://chatgpt.com/codex*
 // @grant        none
 // @license      MIT
-// @downloadURL  https://update.greasyfork.org/scripts/533404/ChatGPT%E5%9B%9E%E5%A4%8D%E8%AE%A1%E6%97%B6%E5%99%A8.user.js
-// @updateURL    https://update.greasyfork.org/scripts/533404/ChatGPT%E5%9B%9E%E5%A4%8D%E8%AE%A1%E6%97%B6%E5%99%A8.meta.js
 // ==/UserScript==
-
 
 (function() {
     'use strict';
 
     // 全局变量定义
-    let startTime = null;      // 记录开始时间的时间戳
-    let timerInterval = null;  // 计时器的间隔ID
-    let timerDisplay = null;   // 显示时间的DOM元素
-    let timerContainer = null; // 计时器容器DOM元素
-    let isGenerating = false;  // 标记是否正在生成回答
-    let lastRequestTime = 0;   // 上次请求的时间戳（用于防止重复计时）
-    let confirmationTimer = null; // 用于确认真实响应的计时器
+    let startTime = null;
+    let timerInterval = null;
+    let timerDisplay = null;
+    let timerContainer = null;
+    let isGenerating = false;
+    let lastRequestTime = 0;
+    let confirmationTimer = null;
+
+    // 防止重复初始化
+    let isInitialized = false;
+
+    // 用于清理的观察者列表
+    let observers = [];
+    let abortController = null;
+
+    // 新增：流式响应监控
+    let streamEndTimer = null;
+    let lastStreamActivity = 0;
+    let isStreamActive = false;
+
+    // 节流函数
+    function throttle(func, limit) {
+        let inThrottle;
+        return function() {
+            const args = arguments;
+            const context = this;
+            if (!inThrottle) {
+                func.apply(context, args);
+                inThrottle = true;
+                setTimeout(() => inThrottle = false, limit);
+            }
+        }
+    }
+
+    // 防抖函数
+    function debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
+    }
+
+    // 安全清理函数
+    function cleanup() {
+        if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+        }
+
+        if (confirmationTimer) {
+            clearTimeout(confirmationTimer);
+            confirmationTimer = null;
+        }
+
+        if (streamEndTimer) {
+            clearTimeout(streamEndTimer);
+            streamEndTimer = null;
+        }
+
+        observers.forEach(observer => {
+            if (observer && observer.disconnect) {
+                observer.disconnect();
+            }
+        });
+        observers = [];
+
+        if (abortController) {
+            abortController.abort();
+            abortController = null;
+        }
+
+        isGenerating = false;
+        isStreamActive = false;
+    }
 
     // 创建并添加计时器显示到页面
     function createTimerDisplay() {
-        if (document.getElementById('chatgpt-mini-timer')) return; // 如果计时器已存在则不重复创建
+        if (document.getElementById('chatgpt-mini-timer')) return;
 
-        // 创建主容器
         timerContainer = document.createElement('div');
         timerContainer.id = 'chatgpt-mini-timer';
-        timerContainer.style.position = 'fixed';
-        timerContainer.style.right = '20px'; // 定位在右侧
-        timerContainer.style.top = '80%';    // 靠下位置
-        timerContainer.style.transform = 'translateY(-50%)';
-        timerContainer.style.zIndex = '10000';
-        timerContainer.style.backgroundColor = 'rgba(0, 0, 0, 0.6)';
-        timerContainer.style.color = 'white';
-        timerContainer.style.padding = '8px 12px';
-        timerContainer.style.borderRadius = '20px';
-        timerContainer.style.fontFamily = 'monospace';
-        timerContainer.style.fontSize = '16px';
-        timerContainer.style.fontWeight = 'bold';
-        timerContainer.style.boxShadow = '0 2px 5px rgba(0, 0, 0, 0.2)';
-        timerContainer.style.transition = 'opacity 0.3s';
-        timerContainer.style.opacity = '0.8';
-        timerContainer.style.userSelect = 'none';
-        timerContainer.style.cursor = 'pointer'; // 添加鼠标指针样式
 
-        // 鼠标悬停效果
+        Object.assign(timerContainer.style, {
+            position: 'fixed',
+            right: '20px',
+            top: '80%',
+            transform: 'translateY(-50%)',
+            zIndex: '10000',
+            backgroundColor: 'rgba(0, 0, 0, 0.6)',
+            color: 'white',
+            padding: '8px 12px',
+            borderRadius: '20px',
+            fontFamily: 'monospace',
+            fontSize: '16px',
+            fontWeight: 'bold',
+            boxShadow: '0 2px 5px rgba(0, 0, 0, 0.2)',
+            transition: 'opacity 0.3s',
+            opacity: '0.8',
+            userSelect: 'none',
+            cursor: 'pointer'
+        });
+
         timerContainer.addEventListener('mouseenter', () => {
-            timerContainer.style.opacity = '1'; // 鼠标悬停时增加不透明度
+            timerContainer.style.opacity = '1';
         });
 
         timerContainer.addEventListener('mouseleave', () => {
-            timerContainer.style.opacity = '0.8'; // 鼠标离开时恢复原透明度
+            timerContainer.style.opacity = '0.8';
         });
 
-        // 添加点击事件，点击计时器可以手动停止/开始计时
         timerContainer.addEventListener('click', () => {
             if (isGenerating) {
                 stopTimer();
             } else {
-                startTimer();
+                startTimer(true);
             }
         });
 
-        // 创建状态文本元素
         const statusText = document.createElement('div');
         statusText.textContent = '就绪';
         statusText.style.fontSize = '12px';
@@ -76,53 +144,57 @@
         statusText.style.textAlign = 'center';
         timerContainer.appendChild(statusText);
 
-        // 创建时间显示元素
         timerDisplay = document.createElement('div');
         timerDisplay.textContent = '0.0s';
         timerDisplay.style.textAlign = 'center';
         timerContainer.appendChild(timerDisplay);
 
-        // 将计时器添加到页面
         document.body.appendChild(timerContainer);
-
-        // 添加提示信息
         timerContainer.title = "点击可手动开始/停止计时\nAlt+S: 手动开始 | Alt+P: 手动停止";
-    }
-
-    // 验证是否真的在生成回答 - 简化验证逻辑，提高启动成功率
-    function isActuallyGenerating() {
-        // 宽松的检测条件，任何看起来像响应处理的情况都会返回true
-        return true;
     }
 
     // 开始计时
     function startTimer(immediate = false) {
-        if (isGenerating) return; // 如果已经在计时中则不重复启动
-        
-        // 简化验证过程，仅短暂延迟以过滤极短的误触发
+        if (isGenerating) return;
+
+        if (confirmationTimer) {
+            clearTimeout(confirmationTimer);
+            confirmationTimer = null;
+        }
+
         if (!immediate) {
-            if (confirmationTimer) {
-                clearTimeout(confirmationTimer);
-            }
-            
             confirmationTimer = setTimeout(() => {
-                startTimer(true); // 几乎无条件启动
-            }, 100); // 缩短延迟到100ms
-            
-            timerContainer.firstChild.textContent = '准备计时...'; // 更新状态文本
+                startTimer(true);
+            }, 100);
+
+            if (timerContainer) {
+                timerContainer.firstChild.textContent = '准备计时...';
+            }
             return;
         }
 
         isGenerating = true;
-        startTime = Date.now(); // 记录开始时间
-        timerDisplay.textContent = '0.0s';
-        timerContainer.style.color = '#ffcc00'; // 计时中显示黄色
-        timerContainer.firstChild.textContent = '计时中...'; // 更新状态文本
+        isStreamActive = false;
+        startTime = Date.now();
+        lastStreamActivity = Date.now();
 
-        // 设置定时器每100毫秒更新一次显示时间
+        if (timerDisplay) {
+            timerDisplay.textContent = '0.0s';
+        }
+        if (timerContainer) {
+            timerContainer.style.color = '#ffcc00';
+            timerContainer.firstChild.textContent = '计时中...';
+        }
+
+        if (timerInterval) {
+            clearInterval(timerInterval);
+        }
+
         timerInterval = setInterval(() => {
-            const elapsed = (Date.now() - startTime) / 1000;
-            timerDisplay.textContent = `${elapsed.toFixed(1)}s`;
+            if (startTime && timerDisplay) {
+                const elapsed = (Date.now() - startTime) / 1000;
+                timerDisplay.textContent = `${elapsed.toFixed(1)}s`;
+            }
         }, 100);
 
         console.log('[ChatGPT计时器] 开始计时');
@@ -130,301 +202,367 @@
 
     // 停止计时
     function stopTimer() {
-        if (!isGenerating) return; // 如果没有在计时则不执行
+        if (!isGenerating) return;
 
-        // 清除确认计时器
         if (confirmationTimer) {
             clearTimeout(confirmationTimer);
             confirmationTimer = null;
         }
 
-        isGenerating = false;
+        if (streamEndTimer) {
+            clearTimeout(streamEndTimer);
+            streamEndTimer = null;
+        }
 
-        // 清除计时器
+        isGenerating = false;
+        isStreamActive = false;
+
         if (timerInterval) {
             clearInterval(timerInterval);
             timerInterval = null;
         }
 
-        // 计算并显示最终时间
-        const elapsed = (Date.now() - startTime) / 1000;
-        timerDisplay.textContent = `${elapsed.toFixed(1)}s`;
-        timerContainer.style.color = 'white'; // 恢复为白色
-        timerContainer.firstChild.textContent = '已完成'; // 更新状态文本
+        if (startTime && timerDisplay && timerContainer) {
+            const elapsed = (Date.now() - startTime) / 1000;
+            timerDisplay.textContent = `${elapsed.toFixed(1)}s`;
+            timerContainer.style.color = 'white';
+            timerContainer.firstChild.textContent = '已完成';
 
-        console.log('[ChatGPT计时器] 停止计时，总耗时：', elapsed.toFixed(1), '秒');
+            console.log('[ChatGPT计时器] 停止计时，总耗时：', elapsed.toFixed(1), '秒');
 
-        // 5秒后重置状态文本
-        setTimeout(() => {
-            if (!isGenerating) {
-                timerContainer.firstChild.textContent = '就绪';
-            }
-        }, 5000);
+            setTimeout(() => {
+                if (!isGenerating && timerContainer) {
+                    timerContainer.firstChild.textContent = '就绪';
+                }
+            }, 5000);
+        }
     }
 
-    // 使用Fetch API拦截器监控网络请求
+    // 检查流是否真正结束的函数
+    function checkStreamEnd() {
+        if (!isGenerating || !isStreamActive) return;
+
+        const now = Date.now();
+        const timeSinceLastActivity = now - lastStreamActivity;
+
+        // 如果超过2秒没有流活动，认为流已结束
+        if (timeSinceLastActivity > 2000) {
+            console.log('[ChatGPT计时器] 流活动停止超过2秒，检查是否真正完成');
+
+            // 额外检查：看是否有"思考中"或加载状态
+            const isThinking = document.querySelector('[data-message-author-role="assistant"]') &&
+                             document.body.textContent.includes('Thinking');
+
+            // 检查是否有停止生成按钮（表示还在生成中）
+            const stopButton = document.querySelector('[data-testid="stop-button"]') ||
+                             document.querySelector('button[aria-label*="stop"]') ||
+                             document.querySelector('button[aria-label*="Stop"]');
+
+            if (!isThinking && !stopButton) {
+                console.log('[ChatGPT计时器] 确认回复完成，停止计时');
+                stopTimer();
+            } else {
+                console.log('[ChatGPT计时器] 检测到仍在生成中，继续等待');
+                // 重新设置检查
+                streamEndTimer = setTimeout(checkStreamEnd, 1000);
+            }
+        } else {
+            // 重新设置检查
+            streamEndTimer = setTimeout(checkStreamEnd, 1000);
+        }
+    }
+
+    // 修复版：使用Fetch API拦截器监控网络请求
     function setupNetworkMonitoring() {
-        // 保存原始的fetch函数
         const originalFetch = window.fetch;
 
-        // 重写fetch函数以监控请求
         window.fetch = async function(...args) {
             const [url, options] = args;
 
-            // 检查是否是ChatGPT的API请求
             const isChatGPTRequest = typeof url === 'string' && (
                 url.includes('/api/conversation') ||
                 url.includes('/backend-api/conversation') ||
                 url.includes('/v1/chat/completions')
             );
 
-            // 检查是否是发送消息的POST请求，简化请求验证标准
             const isMessageSendRequest = isChatGPTRequest &&
                 options &&
                 options.method === 'POST' &&
                 options.body;
 
-            // 如果是发送消息请求，且距离上次请求已经过了至少1秒（防止重复触发但降低门槛）
             if (isMessageSendRequest && (Date.now() - lastRequestTime > 1000)) {
                 console.log('[ChatGPT计时器] 检测到消息发送请求');
                 lastRequestTime = Date.now();
-
-                // 开始计时
                 startTimer();
 
-                // 监控请求完成
                 try {
                     const response = await originalFetch.apply(this, args);
-
-                    // 创建一个新的响应对象进行包装
                     const originalResponse = response.clone();
 
-                    // 判断请求是否成功
                     if (response.ok) {
-                        // 如果是流式响应，监控流的结束
                         if (response.headers.get('content-type')?.includes('text/event-stream')) {
                             console.log('[ChatGPT计时器] 检测到流式响应');
+                            isStreamActive = true;
+                            lastStreamActivity = Date.now();
 
-                            // 创建一个Reader来读取流
                             const reader = response.body.getReader();
+                            const decoder = new TextDecoder();
                             let streamClosed = false;
 
-                            // 读取流直到结束
+                            // 开始检查流结束
+                            if (streamEndTimer) {
+                                clearTimeout(streamEndTimer);
+                            }
+                            streamEndTimer = setTimeout(checkStreamEnd, 2000);
+
                             const processStream = async () => {
                                 try {
                                     while (!streamClosed) {
-                                        const { done } = await reader.read();
-                                        if (done) {
+                                        const result = await Promise.race([
+                                            reader.read(),
+                                            new Promise((_, reject) =>
+                                                setTimeout(() => reject(new Error('Read timeout')), 30000)
+                                            )
+                                        ]);
+
+                                        if (result.done) {
                                             streamClosed = true;
-                                            console.log('[ChatGPT计时器] 流结束，停止计时');
-                                            stopTimer();
+                                            console.log('[ChatGPT计时器] 流数据读取完成');
+                                            // 不要立即停止计时，等待检查机制确认
                                             break;
+                                        } else {
+                                            // 更新流活动时间
+                                            lastStreamActivity = Date.now();
+
+                                            // 解码数据以检查内容
+                                            const chunk = decoder.decode(result.value, { stream: true });
+
+                                            // 检查是否包含结束标志
+                                            if (chunk.includes('[DONE]') || chunk.includes('data: [DONE]')) {
+                                                console.log('[ChatGPT计时器] 检测到流结束标志');
+                                                streamClosed = true;
+                                                // 延迟一点再检查，确保UI更新完成
+                                                setTimeout(() => {
+                                                    if (streamEndTimer) {
+                                                        clearTimeout(streamEndTimer);
+                                                    }
+                                                    streamEndTimer = setTimeout(checkStreamEnd, 500);
+                                                }, 300);
+                                                break;
+                                            }
                                         }
                                     }
                                 } catch (error) {
-                                    console.log('[ChatGPT计时器] 流读取错误，停止计时');
-                                    stopTimer();
+                                    streamClosed = true;
+                                    console.log('[ChatGPT计时器] 流读取错误:', error.message);
+                                    // 出错时也要检查是否真正完成
+                                    setTimeout(() => {
+                                        if (streamEndTimer) {
+                                            clearTimeout(streamEndTimer);
+                                        }
+                                        streamEndTimer = setTimeout(checkStreamEnd, 1000);
+                                    }, 500);
+                                } finally {
+                                    try {
+                                        reader.releaseLock();
+                                    } catch (e) {
+                                        // 忽略释放锁的错误
+                                    }
                                 }
                             };
 
-                            // 启动流处理
                             processStream();
-
-                            // 为了不影响原始响应，我们返回克隆的响应
                             return originalResponse;
                         } else {
-                            // 普通响应，响应完成时停止计时
                             console.log('[ChatGPT计时器] 检测到普通响应');
-                            response.json().then(() => {
-                                console.log('[ChatGPT计时器] 响应完成，停止计时');
+                            // 对于非流式响应，延迟停止以确保内容渲染完成
+                            setTimeout(() => {
+                                console.log('[ChatGPT计时器] 普通响应完成，停止计时');
                                 stopTimer();
-                            }).catch(() => {
-                                // 如果无法解析为JSON，也停止计时
-                                console.log('[ChatGPT计时器] 响应解析错误，停止计时');
-                                stopTimer();
-                            });
-
+                            }, 1000);
                             return originalResponse;
                         }
                     } else {
-                        // 请求失败，停止计时
                         console.log('[ChatGPT计时器] 请求失败，停止计时');
                         stopTimer();
                         return originalResponse;
                     }
                 } catch (error) {
-                    // 捕获请求错误，停止计时
                     console.error('[ChatGPT计时器] 请求异常：', error);
                     stopTimer();
-                    throw error; // 重新抛出异常
+                    throw error;
                 }
             }
 
-            // 对于其他请求，直接使用原始fetch
             return originalFetch.apply(this, args);
         };
     }
 
-    // 监控XMLHttpRequest请求（作为Fetch API的备份）
+    // 修复版：监控XMLHttpRequest请求
     function setupXHRMonitoring() {
         const originalOpen = XMLHttpRequest.prototype.open;
         const originalSend = XMLHttpRequest.prototype.send;
 
-        // 重写open方法
         XMLHttpRequest.prototype.open = function(method, url, ...args) {
             this._chatgptTimerUrl = url;
             this._chatgptTimerMethod = method;
             return originalOpen.apply(this, [method, url, ...args]);
         };
 
-        // 重写send方法
         XMLHttpRequest.prototype.send = function(body) {
             const url = this._chatgptTimerUrl;
             const method = this._chatgptTimerMethod;
 
-            // 检查是否是ChatGPT的API请求
             const isChatGPTRequest = typeof url === 'string' && (
                 url.includes('/api/conversation') ||
                 url.includes('/backend-api/conversation') ||
                 url.includes('/v1/chat/completions')
             );
 
-            // 检查是否是发送消息的POST请求，简化XHR请求验证标准
             const isMessageSendRequest = isChatGPTRequest &&
                 method === 'POST' &&
                 body;
 
-            // 如果是发送消息请求，且距离上次请求已经过了至少1秒（防止重复触发但降低门槛）
             if (isMessageSendRequest && (Date.now() - lastRequestTime > 1000)) {
                 console.log('[ChatGPT计时器] XHR: 检测到消息发送请求');
                 lastRequestTime = Date.now();
-
-                // 开始计时
                 startTimer();
 
-                // 添加加载完成事件监听器
-                this.addEventListener('load', () => {
-                    console.log('[ChatGPT计时器] XHR: 请求完成，停止计时');
-                    stopTimer();
-                });
+                const handleComplete = () => {
+                    // XHR完成后也要延迟检查
+                    setTimeout(() => {
+                        console.log('[ChatGPT计时器] XHR: 请求完成，检查是否真正完成');
+                        if (streamEndTimer) {
+                            clearTimeout(streamEndTimer);
+                        }
+                        streamEndTimer = setTimeout(checkStreamEnd, 1000);
+                    }, 500);
+                };
 
-                // 添加错误事件监听器
-                this.addEventListener('error', () => {
-                    console.log('[ChatGPT计时器] XHR: 请求错误，停止计时');
-                    stopTimer();
-                });
-
-                // 添加终止事件监听器
-                this.addEventListener('abort', () => {
-                    console.log('[ChatGPT计时器] XHR: 请求中止，停止计时');
-                    stopTimer();
-                });
+                this.addEventListener('load', handleComplete, { once: true });
+                this.addEventListener('error', () => stopTimer(), { once: true });
+                this.addEventListener('abort', () => stopTimer(), { once: true });
             }
 
             return originalSend.apply(this, arguments);
         };
     }
 
-    // 特殊监测"Thinking"文本 - 修改后只在ChatGPT回复区域内检测
+    // 修复版：特殊监测"Thinking"文本
     function setupThinkingDetection() {
-        // 创建一个MutationObserver来监视DOM变化
-        const observer = new MutationObserver((mutations) => {
-            // 如果已经在计时中，不需要重复检测
+        const throttledCallback = throttle((mutations) => {
             if (isGenerating) return;
 
-            // 只在ChatGPT回复区域内检测，而不是整个document
-            const chatArea = document.querySelector('.chat-content-wrapper') || document.body;
-            
-            // 检查是否有"Thinking"相关文本
-            const thinkingElements = document.evaluate(
-                ".//*[contains(text(), 'Thinking') or contains(text(), 'thinking...') or contains(text(), '思考中') or contains(text(), '正在思考')]",
-                chatArea,
-                null,
-                XPathResult.UNORDERED_NODE_SNAPSHOT_TYPE,
-                null
-            );
+            const chatContainer = document.querySelector('main') ||
+                                document.querySelector('[role="main"]') ||
+                                document.body;
 
-            // 如果找到包含"Thinking"的元素
-            if (thinkingElements.snapshotLength > 0) {
-                console.log('[ChatGPT计时器] 检测到"Thinking"文本，开始计时');
-                startTimer();
+            const thinkingElements = chatContainer.querySelectorAll('*');
+            for (let element of thinkingElements) {
+                const text = element.textContent || '';
+                if (text.includes('Thinking') ||
+                    text.includes('thinking...') ||
+                    text.includes('思考中') ||
+                    text.includes('正在思考')) {
+                    console.log('[ChatGPT计时器] 检测到"Thinking"文本，开始计时');
+                    startTimer();
+                    break;
+                }
             }
-        });
+        }, 500);
 
-        // 开始观察整个文档，但通过查询选择器限制范围
-        observer.observe(document.body, {
+        const observer = new MutationObserver(throttledCallback);
+
+        const targetNode = document.querySelector('main') || document.body;
+        observer.observe(targetNode, {
             childList: true,
             subtree: true,
             characterData: true
         });
+
+        observers.push(observer);
     }
 
-    // 监测DOM变化以检测回复完成
+    // 更精确的DOM完成检测
     function setupDOMCompletionDetection() {
-        const observer = new MutationObserver((mutations) => {
-            // 如果没有在计时，则不需要检查
+        const throttledCallback = throttle((mutations) => {
             if (!isGenerating) return;
 
-            // 检查是否出现了回复完成后的操作按钮
-            const copyButton = document.querySelector('[data-testid="copy-turn-action-button"]');
-            const goodResponseButton = document.querySelector('[data-testid="good-response-turn-action-button"]');
-            const badResponseButton = document.querySelector('[data-testid="bad-response-turn-action-button"]');
-            const voicePlayButton = document.querySelector('[data-testid="voice-play-turn-action-button"]');
+            // 检查停止按钮是否消失（更准确的完成指标）
+            const stopButton = document.querySelector('[data-testid="stop-button"]') ||
+                             document.querySelector('button[aria-label*="stop"]') ||
+                             document.querySelector('button[aria-label*="Stop"]');
 
-            // 如果检测到这些按钮之一，说明回复已经完成
-            if (copyButton || goodResponseButton || badResponseButton || voicePlayButton) {
-                console.log('[ChatGPT计时器] 检测到回复完成的DOM元素，停止计时');
-                stopTimer();
+            // 检查是否还在思考
+            const isThinking = document.body.textContent.includes('Thinking');
+
+            // 检查操作按钮是否出现
+            const actionButtons = document.querySelectorAll([
+                '[data-testid="copy-turn-action-button"]',
+                '[data-testid="good-response-turn-action-button"]',
+                '[data-testid="bad-response-turn-action-button"]',
+                '[data-testid="voice-play-turn-action-button"]'
+            ].join(','));
+
+            // 只有当没有停止按钮、没有思考状态、且有操作按钮时才认为完成
+            if (!stopButton && !isThinking && actionButtons.length > 0) {
+                // 额外延迟确保真正完成
+                setTimeout(() => {
+                    const stillGenerating = document.querySelector('[data-testid="stop-button"]') ||
+                                          document.body.textContent.includes('Thinking');
+                    if (!stillGenerating) {
+                        console.log('[ChatGPT计时器] DOM检测确认回复完成，停止计时');
+                        stopTimer();
+                    }
+                }, 1000);
             }
-        });
+        }, 300);
 
-        // 监测整个文档的变化
+        const observer = new MutationObserver(throttledCallback);
         observer.observe(document.body, {
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['data-testid']
+            attributeFilter: ['data-testid', 'aria-label']
         });
+
+        observers.push(observer);
     }
 
-    // 检测用户是否正在输入，如果是则不触发计时
+    // 检测用户输入
     function setupUserInputDetection() {
-        // 监听输入框的焦点事件
-        document.addEventListener('focusin', (event) => {
-            // 检查获得焦点的元素是否是输入框
-            if (event.target.tagName === 'TEXTAREA' || 
-                event.target.tagName === 'INPUT' || 
+        const handleFocusIn = (event) => {
+            if (event.target.tagName === 'TEXTAREA' ||
+                event.target.tagName === 'INPUT' ||
                 event.target.getAttribute('role') === 'textbox' ||
                 event.target.getAttribute('contenteditable') === 'true') {
-                // 标记为用户正在输入
                 window._userIsTyping = true;
             }
-        });
-        
-        // 监听输入框失去焦点事件
-        document.addEventListener('focusout', (event) => {
-            // 检查失去焦点的元素是否是输入框
-            if (event.target.tagName === 'TEXTAREA' || 
-                event.target.tagName === 'INPUT' || 
+        };
+
+        const handleFocusOut = (event) => {
+            if (event.target.tagName === 'TEXTAREA' ||
+                event.target.tagName === 'INPUT' ||
                 event.target.getAttribute('role') === 'textbox' ||
                 event.target.getAttribute('contenteditable') === 'true') {
-                // 取消用户正在输入标记
                 window._userIsTyping = false;
             }
-        });
+        };
+
+        document.addEventListener('focusin', handleFocusIn);
+        document.addEventListener('focusout', handleFocusOut);
     }
 
     // 添加键盘快捷键支持
     function setupKeyboardShortcuts() {
         document.addEventListener('keydown', (event) => {
-            // Alt+S 开始计时，Alt+P 停止计时
             if (event.altKey) {
                 if (event.key === 's' || event.key === 'S') {
-                    startTimer(true); // 强制开始计时
-                    event.preventDefault(); // 阻止默认行为
+                    startTimer(true);
+                    event.preventDefault();
                 } else if (event.key === 'p' || event.key === 'P') {
                     stopTimer();
-                    event.preventDefault(); // 阻止默认行为
+                    event.preventDefault();
                 }
             }
         });
@@ -432,30 +570,51 @@
 
     // 初始化函数
     function initialize() {
-        createTimerDisplay();          // 创建计时器显示
-        setupNetworkMonitoring();      // 设置网络请求监控（使用Fetch API）
-        setupXHRMonitoring();          // 设置XHR请求监控（备用方案）
-        setupThinkingDetection();      // 设置"Thinking"文本检测
-        setupDOMCompletionDetection(); // 设置DOM完成检测
-        setupUserInputDetection();     // 设置用户输入检测
-        setupKeyboardShortcuts();      // 设置键盘快捷键
+        if (isInitialized) {
+            console.log('[ChatGPT计时器] 已经初始化过了，跳过重复初始化');
+            return;
+        }
 
-        console.log('[ChatGPT计时器] 初始化完成，等待使用...');
+        try {
+            createTimerDisplay();
+            setupNetworkMonitoring();
+            setupXHRMonitoring();
+            setupThinkingDetection();
+            setupDOMCompletionDetection();
+            setupUserInputDetection();
+            setupKeyboardShortcuts();
+
+            isInitialized = true;
+            console.log('[ChatGPT计时器] 初始化完成，等待使用...');
+        } catch (error) {
+            console.error('[ChatGPT计时器] 初始化失败:', error);
+        }
     }
+
+    // 页面卸载时清理
+    window.addEventListener('beforeunload', cleanup);
+
+    // 监听页面可见性变化
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            cleanup();
+        }
+    });
 
     // 页面加载完成后初始化
     if (document.readyState === 'complete') {
-        initialize();
+        setTimeout(initialize, 1000);
     } else {
         window.addEventListener('load', () => {
-            setTimeout(initialize, 1000); // 延迟1秒初始化以确保页面完全加载
+            setTimeout(initialize, 1000);
         });
     }
 
-    // 备用初始化方法，以防主方法失败
+    // 备用初始化
     setTimeout(() => {
-        if (!document.getElementById('chatgpt-mini-timer')) {
+        if (!isInitialized) {
             initialize();
         }
     }, 3000);
+
 })();
