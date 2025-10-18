@@ -12,8 +12,8 @@
 // @grant        none
 // @inject-into  page
 // @license      MIT
-// @downloadURL  https://raw.githubusercontent.com/lueluelue2006/ChatGPT-Timer/main/ChatGPT_Timer.js
-// @updateURL    https://raw.githubusercontent.com/lueluelue2006/ChatGPT-Timer/main/ChatGPT_Timer.js
+// @downloadURL  https://raw.githubusercontent.com/lueluelue2006/ChatGPT-Timer/main/ChatGPT_Timer/ChatGPT_Timer.js
+// @updateURL    https://raw.githubusercontent.com/lueluelue2006/ChatGPT-Timer/main/ChatGPT_Timer/ChatGPT_Timer.js
 // ==/UserScript==
 
 /*
